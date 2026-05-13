@@ -23,6 +23,26 @@ API_KEY = os.getenv("API_KEY_AMBIENTES")
 API_BASE_URL = os.getenv("API_URL_BASE", "").rstrip("/")
 # Si es true, no se infiere session_id por heurística (modo multi-cliente / producción).
 MCP_SSE_STRICT_SESSION = os.getenv("MCP_SSE_STRICT_SESSION", "").lower() in ("1", "true", "yes")
+# Logs estructurados para diagnosticar 400/404 en POST MCP (no activar en producción con tráfico alto).
+MCP_DEBUG = os.getenv("MCP_DEBUG", "").lower() in ("1", "true", "yes")
+
+_EMPTY = "(vacío)"
+
+
+def _mcp_mask_token(value: str, head: int = 4, tail: int = 4) -> str:
+    v = (value or "").strip()
+    if not v:
+        return _EMPTY
+    if len(v) <= head + tail + 3:
+        return "***"
+    return f"{v[:head]}…{v[-tail:]}"
+
+
+def _mcp_debug(message: str, **fields: Any) -> None:
+    if not MCP_DEBUG:
+        return
+    parts = [f"{k}={v!r}" for k, v in sorted(fields.items())]
+    logger.info("[MCP-DEBUG] %s | %s", message, " ".join(parts))
 
 # Sesiones MCP abiertas por GET /mcp (más reciente al final). El SDK no borra entradas de
 # `_read_stream_writers`, así que no basta con len(writers)==1 tras varias conexiones.
@@ -178,6 +198,11 @@ def _scope_for_mcp_post(request: Request) -> Scope:
         params = {}
 
     if params.get("session_id"):
+        _mcp_debug(
+            "POST session_id desde query",
+            path=request.url.path,
+            session_id_masked=_mcp_mask_token(str(params.get("session_id", ""))),
+        )
         return scope
 
     header_sid = (
@@ -186,13 +211,32 @@ def _scope_for_mcp_post(request: Request) -> Scope:
     )
     if header_sid:
         params["session_id"] = _normalize_session_token(header_sid)
+        _mcp_debug(
+            "POST session_id desde cabecera",
+            path=request.url.path,
+            header_masked=_mcp_mask_token(header_sid),
+        )
         return _scope_with_query_string(scope, params)
 
     if MCP_SSE_STRICT_SESSION:
+        writers = getattr(sse, "_read_stream_writers", None)
+        wcount = len(writers) if isinstance(writers, dict) else -1
+        _mcp_debug(
+            "POST sin session_id y MCP_SSE_STRICT_SESSION activo (no hay heurística)",
+            path=request.url.path,
+            writers_count=wcount,
+            recent_sessions=len(_RECENT_MCP_SESSION_HEX),
+        )
         return scope
 
     writers = getattr(sse, "_read_stream_writers", None)
     if not isinstance(writers, dict) or not writers:
+        _mcp_debug(
+            "POST sin session_id y sin writers en esta instancia (¿POST en otro pod?)",
+            path=request.url.path,
+            writers_count=0,
+            recent_sessions=len(_RECENT_MCP_SESSION_HEX),
+        )
         return scope
 
     fb_hex = _fallback_session_hex_for_post(writers)
@@ -202,14 +246,45 @@ def _scope_for_mcp_post(request: Request) -> Scope:
             "MCP POST sin session_id ni cabecera: usando heurística de sesión "
             "(última o única en este proceso)."
         )
+        _mcp_debug(
+            "POST session_id por heurística",
+            path=request.url.path,
+            writers_count=len(writers),
+            chosen_masked=_mcp_mask_token(fb_hex),
+            recent_sessions=len(_RECENT_MCP_SESSION_HEX),
+        )
         return _scope_with_query_string(scope, params)
 
+    _mcp_debug(
+        "POST sin session_id y heurística sin coincidencia (deque vacío o UUIDs no en writers)",
+        path=request.url.path,
+        writers_count=len(writers),
+        recent_sessions=len(_RECENT_MCP_SESSION_HEX),
+    )
     return scope
 
 
 async def _mcp_post_message(request: Request) -> Response:
     """Delegado ASGI para JSON-RPC; la respuesta real la emite el transporte MCP."""
+    qs_in = (request.scope.get("query_string") or b"").decode("latin-1", errors="replace")
+    _mcp_debug(
+        "POST MCP entrada",
+        path=request.url.path,
+        query_string=qs_in or _EMPTY,
+        content_type=request.headers.get("content-type") or _EMPTY,
+        content_length=request.headers.get("content-length") or "?",
+        has_mcp_session_id_header=bool(request.headers.get(MCP_SESSION_ID_HEADER)),
+        has_x_session_id_header=bool(request.headers.get("x-session-id")),
+        strict_session=MCP_SSE_STRICT_SESSION,
+    )
     scope = _scope_for_mcp_post(request)
+    qs_out = (scope.get("query_string") or b"").decode("latin-1", errors="replace")
+    _mcp_debug(
+        "POST MCP scope resuelto",
+        path=request.url.path,
+        query_after=qs_out or _EMPTY,
+        session_injected=qs_in != qs_out,
+    )
     await sse.handle_post_message(scope, request.receive, request._send)
     return AlreadyHandledResponse()
 
@@ -225,7 +300,14 @@ async def mcp_sse(request: Request) -> Response:
         keys_after = frozenset(sse._read_stream_writers.keys())
         new_keys = keys_after - keys_before
         if len(new_keys) == 1:
-            _RECENT_MCP_SESSION_HEX.append(next(iter(new_keys)).hex)
+            sid_hex = next(iter(new_keys)).hex
+            _RECENT_MCP_SESSION_HEX.append(sid_hex)
+            _mcp_debug(
+                "SSE sesión registrada en deque",
+                session_masked=_mcp_mask_token(sid_hex),
+                deque_len=len(_RECENT_MCP_SESSION_HEX),
+                writers_total=len(keys_after),
+            )
         await mcp_server.run(
             streams[0],
             streams[1],
