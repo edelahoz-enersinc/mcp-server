@@ -53,7 +53,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
     headers = {"x-api-key": API_KEY}
     
-    # HERRAMIENTA: CONSULTAR
     if name == "consultar_estado_ambiente":
         ambiente = arguments.get("ambiente")
         url = f"{API_BASE_URL}/status/{ambiente}"
@@ -64,7 +63,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error al consultar: {str(e)}")]
 
-    # HERRAMIENTA: ACCIÓN (ENCENDER/APAGAR)
     elif name == "ejecutar_accion_ambiente":
         ambiente = arguments.get("ambiente")
         accion = arguments.get("accion")
@@ -76,8 +74,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                 response = await client.post(url, json=payload, timeout=15.0)
                 response.raise_for_status()
                 data = response.json()
-                
-            # Procesamos los mensajes de la respuesta para que la IA entienda qué pasó
+            
             resumen = []
             for recurso, info in data.get("resultados", {}).items():
                 msg = info.get("messages", ["Sin mensaje"])[-1]
@@ -91,17 +88,21 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
     return [types.TextContent(type="text", text="Herramienta no encontrada.")]
 
-# --- 3. CONFIGURACIÓN FASTAPI ---
+# --- 3. CONFIGURACIÓN FASTAPI Y SSE ---
 app = FastAPI()
 sse = SseServerTransport("/messages")
 
-app.mount("/messages", sse.handle_post_message)
-
 @app.get("/mcp")
 async def handle_sse(request: Request):
+    """Punto de entrada para la conexión SSE."""
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await mcp_server.run(
             streams[0],
             streams[1],
             mcp_server.create_initialization_options()
         )
+
+@app.post("/messages")
+async def handle_messages(request: Request):
+    """Punto de entrada para los mensajes POST que envía la IA."""
+    await sse.handle_post_message(request.scope, request.receive, request._send)
