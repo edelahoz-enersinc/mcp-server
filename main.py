@@ -1,6 +1,9 @@
+import json
 import logging
 import os
+import sys
 from collections import deque
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
 from uuid import UUID
@@ -21,10 +24,99 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("API_KEY_AMBIENTES")
 API_BASE_URL = os.getenv("API_URL_BASE", "").rstrip("/")
+
+
+def _tool_text_for_mcp(text: str) -> str:
+    """
+    Normaliza texto para respuestas MCP: puntuación tipográfica que a veces rompe
+    serializadores estrictos (p. ej. U+2026 …). El cuerpo sigue en UTF-8 (español).
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return (
+        text.replace("\u2026", "...")
+        .replace("\u2013", "-")
+        .replace("\u2014", "--")
+        .replace("\u00a0", " ")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
 # Si es true, no se infiere session_id por heurística (modo multi-cliente / producción).
 MCP_SSE_STRICT_SESSION = os.getenv("MCP_SSE_STRICT_SESSION", "").lower() in ("1", "true", "yes")
 # Logs estructurados para diagnosticar 400/404 en POST MCP (no activar en producción con tráfico alto).
-MCP_DEBUG = os.getenv("MCP_DEBUG", "").lower() in ("1", "true", "yes")
+# Comprueba en tiempo de ejecución (p. ej. tras load_dotenv / vars de Cloud Run).
+def _mcp_is_debug() -> bool:
+    return os.getenv("MCP_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+_MCP_LOGGING_READY = False
+_MCP_BOOT_LINE_PRINTED = False
+
+
+def _ensure_mcp_logger_emits_debug() -> None:
+    """Uvicorn a veces deja el root en WARNING; añadimos handler propio al logger `main`."""
+    global _MCP_LOGGING_READY
+    if _MCP_LOGGING_READY:
+        return
+    _MCP_LOGGING_READY = True
+    if not _mcp_is_debug():
+        return
+    lg = logging.getLogger(__name__)
+    lg.setLevel(logging.DEBUG)
+    if lg.handlers:
+        return
+    h = logging.StreamHandler(sys.stderr)
+    h.setLevel(logging.DEBUG)
+    h.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    lg.addHandler(h)
+    lg.propagate = False
+
+
+def _print_mcp_boot_once() -> None:
+    """Siempre va a stdout (Cloud Run); sin secretos. Comprueba que las vars llegaron al proceso."""
+    global _MCP_BOOT_LINE_PRINTED
+    if _MCP_BOOT_LINE_PRINTED:
+        return
+    _MCP_BOOT_LINE_PRINTED = True
+    raw_debug = os.getenv("MCP_DEBUG")
+    strict = os.getenv("MCP_SSE_STRICT_SESSION")
+    key_ok = bool((os.getenv("API_KEY_AMBIENTES") or "").strip())
+    base = (os.getenv("API_URL_BASE") or "").strip()
+    print(
+        "[MCP-BOOT] "
+        f"MCP_DEBUG_env={raw_debug!r} effective_debug={_mcp_is_debug()} "
+        f"MCP_SSE_STRICT_SESSION={strict!r} "
+        f"API_KEY_AMBIENTES={'set' if key_ok else 'MISSING'} "
+        f"API_URL_BASE_len={len(base)} "
+        f"K_SERVICE={os.getenv('K_SERVICE', '')!r} K_REVISION={os.getenv('K_REVISION', '')!r}",
+        flush=True,
+    )
+    if base:
+        tail = base[-40:] if len(base) > 40 else base
+        print(f"[MCP-BOOT] API_URL_BASE_suffix=...{tail}", flush=True)
+    if not _mcp_is_debug():
+        print(
+            "[MCP-BOOT] MCP_DEBUG no está activo; añade MCP_DEBUG=1 en el servicio para logs [MCP-DEBUG]",
+            flush=True,
+        )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _ensure_mcp_logger_emits_debug()
+    _print_mcp_boot_once()
+    logger.info(
+        "[MCP-BOOT] logger=%s handlers=%s debug=%s",
+        __name__,
+        len(logger.handlers),
+        _mcp_is_debug(),
+    )
+    yield
+
 
 _EMPTY = "(vacío)"
 
@@ -35,12 +127,13 @@ def _mcp_mask_token(value: str, head: int = 4, tail: int = 4) -> str:
         return _EMPTY
     if len(v) <= head + tail + 3:
         return "***"
-    return f"{v[:head]}…{v[-tail:]}"
+    return f"{v[:head]}...{v[-tail:]}"
 
 
 def _mcp_debug(message: str, **fields: Any) -> None:
-    if not MCP_DEBUG:
+    if not _mcp_is_debug():
         return
+    _ensure_mcp_logger_emits_debug()
     parts = [f"{k}={v!r}" for k, v in sorted(fields.items())]
     logger.info("[MCP-DEBUG] %s | %s", message, " ".join(parts))
 
@@ -113,9 +206,10 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
         try:
             async with httpx.AsyncClient(headers=headers) as client:
                 response = await client.get(url, timeout=15.0)
-                return [types.TextContent(type="text", text=str(response.json()))]
+                body = json.dumps(response.json(), ensure_ascii=False, separators=(",", ":"))
+                return [types.TextContent(type="text", text=_tool_text_for_mcp(body))]
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Error al consultar: {str(e)}")]
+            return [types.TextContent(type="text", text=_tool_text_for_mcp(f"Error al consultar: {e!s}"))]
 
     if name == "ejecutar_accion_ambiente":
         ambiente = arguments.get("ambiente")
@@ -131,14 +225,15 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
 
             resumen = []
             for recurso, info in data.get("resultados", {}).items():
-                msg = info.get("messages", ["Sin mensaje"])[-1]
+                raw = info.get("messages", ["Sin mensaje"])[-1]
+                msg = raw if isinstance(raw, str) else str(raw)
                 resumen.append(f"- {recurso}: {msg}")
 
             texto_final = f"Resultado de la acción {accion} en {ambiente}:\n" + "\n".join(resumen)
-            return [types.TextContent(type="text", text=texto_final)]
+            return [types.TextContent(type="text", text=_tool_text_for_mcp(texto_final))]
 
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Error al ejecutar acción: {str(e)}")]
+            return [types.TextContent(type="text", text=_tool_text_for_mcp(f"Error al ejecutar acción: {e!s}"))]
 
     return [types.TextContent(type="text", text="Herramienta no encontrada.")]
 
@@ -147,6 +242,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
 app = FastAPI(
     title="Gestor ambientes ETRM (MCP)",
     description="Servidor MCP sobre HTTP+SSE para consulta y control de ambientes.",
+    lifespan=_lifespan,
 )
 
 # Mismo path que GET /mcp: el evento SSE `endpoint` será `/mcp?session_id=<hex>`.
