@@ -1,5 +1,7 @@
 import os
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
+from uuid import UUID
 
 import httpx
 import mcp.types as types
@@ -7,6 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
@@ -116,12 +119,55 @@ app = FastAPI(
     description="Servidor MCP sobre HTTP+SSE para consulta y control de ambientes.",
 )
 
-sse = SseServerTransport("/messages")
+# Mismo path que GET /mcp: el evento SSE `endpoint` será `/mcp?session_id=<hex>`.
+sse = SseServerTransport("/mcp")
+
+
+def _scope_for_mcp_post(request: Request) -> Scope:
+    """
+    El transporte SSE espera `session_id` en la query. Algunos clientes envían POST
+    a `/mcp` sin query pero con la cabecera `mcp-session-id` (mismo nombre que el
+    transporte HTTP streamable del SDK).
+    """
+    scope = request.scope
+    raw_qs = scope.get("query_string") or b""
+    try:
+        params = dict(parse_qsl(raw_qs.decode("latin-1"), keep_blank_values=True))
+    except ValueError:
+        params = {}
+
+    if params.get("session_id"):
+        return scope
+
+    header_sid = (
+        (request.headers.get(MCP_SESSION_ID_HEADER) or "").strip()
+        or (request.headers.get("x-session-id") or "").strip()
+    )
+
+    if params.get("session_id"):
+        return scope
+
+    header_sid = (request.headers.get(MCP_SESSION_ID_HEADER) or "").strip()
+    if not header_sid:
+        return scope
+
+    sid = header_sid
+    if "-" in sid:
+        try:
+            sid = UUID(sid).hex
+        except ValueError:
+            sid = header_sid
+
+    params["session_id"] = sid
+    merged = dict(scope)
+    merged["query_string"] = urlencode(params).encode("latin-1")
+    return merged
 
 
 async def _mcp_post_message(request: Request) -> Response:
     """Delegado ASGI para JSON-RPC; la respuesta real la emite el transporte MCP."""
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    scope = _scope_for_mcp_post(request)
+    await sse.handle_post_message(scope, request.receive, request._send)
     return AlreadyHandledResponse()
 
 
@@ -129,7 +175,7 @@ async def _mcp_post_message(request: Request) -> Response:
 async def mcp_sse(request: Request) -> Response:
     """
     Conexión SSE del protocolo MCP: el cliente abre GET aquí y recibe el evento
-    `endpoint` con la URL para POST de mensajes JSON-RPC.
+    `endpoint` con la URL relativa `POST /mcp?session_id=<hex>` para mensajes JSON-RPC.
     """
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await mcp_server.run(
@@ -143,16 +189,13 @@ async def mcp_sse(request: Request) -> Response:
 @app.post("/mcp")
 async def mcp_post_on_sse_path(request: Request) -> Response:
     """
-    Algunos clientes (p. ej. configuración con URL base `.../mcp`) envían POST
-    JSON-RPC al mismo path que el SSE; sin esta ruta aparece 405 Method Not Allowed.
-    El evento SSE sigue anunciando `POST /messages?session_id=...` para clientes compatibles.
+    JSON-RPC MCP en el mismo path que el SSE. Usa `?session_id=` del evento `endpoint`
+    o la cabecera `mcp-session-id` (hex 32 chars o UUID con guiones).
     """
     return await _mcp_post_message(request)
 
 
 @app.post("/messages")
 async def mcp_messages(request: Request) -> Response:
-    """
-    Receptor estándar: el transporte anuncia este path en el evento `endpoint` del SSE.
-    """
+    """Compatibilidad: clientes antiguos o proxies que siguen posteando a `/messages`."""
     return await _mcp_post_message(request)
