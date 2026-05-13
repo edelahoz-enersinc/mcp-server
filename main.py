@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
@@ -15,8 +16,12 @@ from starlette.types import Receive, Scope, Send
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 API_KEY = os.getenv("API_KEY_AMBIENTES")
 API_BASE_URL = os.getenv("API_URL_BASE", "").rstrip("/")
+# Si es true, no se infiere session_id cuando solo hay una sesión SSE (modo multi-cliente).
+MCP_SSE_STRICT_SESSION = os.getenv("MCP_SSE_STRICT_SESSION", "").lower() in ("1", "true", "yes")
 
 
 class AlreadyHandledResponse(Response):
@@ -123,11 +128,28 @@ app = FastAPI(
 sse = SseServerTransport("/mcp")
 
 
+def _normalize_session_token(value: str) -> str:
+    sid = value.strip()
+    if "-" in sid:
+        try:
+            return UUID(sid).hex
+        except ValueError:
+            pass
+    return sid
+
+
+def _scope_with_query_string(scope: Scope, params: dict[str, str]) -> Scope:
+    merged = dict(scope)
+    merged["query_string"] = urlencode(params).encode("latin-1")
+    return merged
+
+
 def _scope_for_mcp_post(request: Request) -> Scope:
     """
-    El transporte SSE espera `session_id` en la query. Algunos clientes envían POST
-    a `/mcp` sin query pero con la cabecera `mcp-session-id` (mismo nombre que el
-    transporte HTTP streamable del SDK).
+    El transporte SSE espera `session_id` en la query. Compatibilidad:
+    - Cabecera `mcp-session-id` o `x-session-id` (hex o UUID).
+    - Si `MCP_SSE_STRICT_SESSION` no está activado y solo hay una sesión SSE abierta,
+      se usa esa sesión (clientes que POSTean a `/mcp` sin query ni cabeceras).
     """
     scope = request.scope
     raw_qs = scope.get("query_string") or b""
@@ -143,25 +165,23 @@ def _scope_for_mcp_post(request: Request) -> Scope:
         (request.headers.get(MCP_SESSION_ID_HEADER) or "").strip()
         or (request.headers.get("x-session-id") or "").strip()
     )
+    if header_sid:
+        params["session_id"] = _normalize_session_token(header_sid)
+        return _scope_with_query_string(scope, params)
 
-    if params.get("session_id"):
-        return scope
+    if not MCP_SSE_STRICT_SESSION:
+        writers = getattr(sse, "_read_stream_writers", None)
+        if isinstance(writers, dict) and len(writers) == 1:
+            only_id = next(iter(writers.keys()))
+            params["session_id"] = only_id.hex
+            logger.warning(
+                "MCP POST sin session_id ni cabecera de sesión: "
+                "enrutando a la única sesión SSE activa. "
+                "Para varios clientes, define MCP_SSE_STRICT_SESSION=1 y corrige el cliente."
+            )
+            return _scope_with_query_string(scope, params)
 
-    header_sid = (request.headers.get(MCP_SESSION_ID_HEADER) or "").strip()
-    if not header_sid:
-        return scope
-
-    sid = header_sid
-    if "-" in sid:
-        try:
-            sid = UUID(sid).hex
-        except ValueError:
-            sid = header_sid
-
-    params["session_id"] = sid
-    merged = dict(scope)
-    merged["query_string"] = urlencode(params).encode("latin-1")
-    return merged
+    return scope
 
 
 async def _mcp_post_message(request: Request) -> Response:
@@ -189,13 +209,14 @@ async def mcp_sse(request: Request) -> Response:
 @app.post("/mcp")
 async def mcp_post_on_sse_path(request: Request) -> Response:
     """
-    JSON-RPC MCP en el mismo path que el SSE. Usa `?session_id=` del evento `endpoint`
-    o la cabecera `mcp-session-id` (hex 32 chars o UUID con guiones).
+    JSON-RPC MCP en el mismo path que el SSE. Orden de resolución de sesión:
+    query `session_id`, cabecera `mcp-session-id` / `x-session-id`, o (si no
+    `MCP_SSE_STRICT_SESSION`) la única sesión SSE abierta en este proceso.
     """
     return await _mcp_post_message(request)
 
 
 @app.post("/messages")
 async def mcp_messages(request: Request) -> Response:
-    """Compatibilidad: clientes antiguos o proxies que siguen posteando a `/messages`."""
+    """Igual que POST /mcp; conservado por compatibilidad."""
     return await _mcp_post_message(request)
