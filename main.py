@@ -119,6 +119,12 @@ app = FastAPI(
 sse = SseServerTransport("/messages")
 
 
+async def _mcp_post_message(request: Request) -> Response:
+    """Delegado ASGI para JSON-RPC; la respuesta real la emite el transporte MCP."""
+    await sse.handle_post_message(request.scope, request.receive, request._send)
+    return AlreadyHandledResponse()
+
+
 @app.get("/mcp")
 async def mcp_sse(request: Request) -> Response:
     """
@@ -134,11 +140,19 @@ async def mcp_sse(request: Request) -> Response:
     return AlreadyHandledResponse()
 
 
+@app.post("/mcp")
+async def mcp_post_on_sse_path(request: Request) -> Response:
+    """
+    Algunos clientes (p. ej. configuración con URL base `.../mcp`) envían POST
+    JSON-RPC al mismo path que el SSE; sin esta ruta aparece 405 Method Not Allowed.
+    El evento SSE sigue anunciando `POST /messages?session_id=...` para clientes compatibles.
+    """
+    return await _mcp_post_message(request)
+
+
 @app.post("/messages")
 async def mcp_messages(request: Request) -> Response:
     """
-    Receptor de mensajes JSON-RPC del cliente MCP (mismo path que anuncia el
-    transporte en `SseServerTransport("/messages")`).
+    Receptor estándar: el transporte anuncia este path en el evento `endpoint` del SSE.
     """
-    await sse.handle_post_message(request.scope, request.receive, request._send)
-    return AlreadyHandledResponse()
+    return await _mcp_post_message(request)
