@@ -413,12 +413,27 @@ async def mcp_sse(request: Request) -> Response:
 
 
 @app.post("/mcp")
-async def mcp_post_on_sse_path(request: Request) -> Response:
+async def handle_messages(request: Request) -> Response:
     """
-    JSON-RPC MCP en el mismo path que el SSE. Resolución de `session_id`: query,
-    cabeceras `mcp-session-id` / `x-session-id`, o heurística local si no
-    `MCP_SSE_STRICT_SESSION` (ver `_RECENT_MCP_SESSION_HEX` en GET /mcp).
+    Mensajes JSON-RPC del agente hacia ``POST /mcp`` (mismo path que el SSE).
+
+    No se puede inventar una sesión MCP válida sin el flujo SSE en esta instancia:
+    el transporte exige un ``session_id`` que exista en ``_read_stream_writers``.
+    Un ``JSONResponse`` alternativo rompería el protocolo y podría duplicar la
+    respuesta ASGI respecto a ``handle_post_message``.
+
+    Si ves 400 en multi-réplica (p. ej. Agent Platform + Cloud Run), usa **session
+    affinity** o **max-instances=1** para que GET SSE y POST compartan proceso.
     """
+    initial_sid = request.query_params.get("session_id")
+    writers = getattr(sse, "_read_stream_writers", None)
+    nwriters = len(writers) if isinstance(writers, dict) else 0
+    if not initial_sid and nwriters == 0:
+        logger.warning(
+            "POST /mcp sin session_id en la petición y sin sesiones SSE en esta "
+            "instancia (writers=0). Causa habitual: POST en otra réplica que el GET "
+            "/mcp. Mitigación: session affinity o max-instances=1 en Cloud Run."
+        )
     return await _mcp_post_message(request)
 
 
