@@ -1,5 +1,6 @@
 import logging
 import os
+from collections import deque
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
 from uuid import UUID
@@ -20,8 +21,12 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("API_KEY_AMBIENTES")
 API_BASE_URL = os.getenv("API_URL_BASE", "").rstrip("/")
-# Si es true, no se infiere session_id cuando solo hay una sesión SSE (modo multi-cliente).
+# Si es true, no se infiere session_id por heurística (modo multi-cliente / producción).
 MCP_SSE_STRICT_SESSION = os.getenv("MCP_SSE_STRICT_SESSION", "").lower() in ("1", "true", "yes")
+
+# Sesiones MCP abiertas por GET /mcp (más reciente al final). El SDK no borra entradas de
+# `_read_stream_writers`, así que no basta con len(writers)==1 tras varias conexiones.
+_RECENT_MCP_SESSION_HEX: deque[str] = deque(maxlen=64)
 
 
 class AlreadyHandledResponse(Response):
@@ -144,12 +149,26 @@ def _scope_with_query_string(scope: Scope, params: dict[str, str]) -> Scope:
     return merged
 
 
+def _fallback_session_hex_for_post(writers: dict[UUID, Any]) -> str | None:
+    """Elige sesión cuando el POST no trae `session_id` (heurística; desactivar con MCP_SSE_STRICT_SESSION)."""
+    if len(writers) == 1:
+        return next(iter(writers.keys())).hex
+    for hx in reversed(_RECENT_MCP_SESSION_HEX):
+        try:
+            uid = UUID(hex=hx)
+        except ValueError:
+            continue
+        if uid in writers:
+            return hx
+    return None
+
+
 def _scope_for_mcp_post(request: Request) -> Scope:
     """
     El transporte SSE espera `session_id` en la query. Compatibilidad:
     - Cabecera `mcp-session-id` o `x-session-id` (hex o UUID).
-    - Si `MCP_SSE_STRICT_SESSION` no está activado y solo hay una sesión SSE abierta,
-      se usa esa sesión (clientes que POSTean a `/mcp` sin query ni cabeceras).
+    - Si `MCP_SSE_STRICT_SESSION` no está activado: sesión única en el transporte o la
+      más reciente registrada por GET /mcp en este proceso (deque).
     """
     scope = request.scope
     raw_qs = scope.get("query_string") or b""
@@ -169,17 +188,21 @@ def _scope_for_mcp_post(request: Request) -> Scope:
         params["session_id"] = _normalize_session_token(header_sid)
         return _scope_with_query_string(scope, params)
 
-    if not MCP_SSE_STRICT_SESSION:
-        writers = getattr(sse, "_read_stream_writers", None)
-        if isinstance(writers, dict) and len(writers) == 1:
-            only_id = next(iter(writers.keys()))
-            params["session_id"] = only_id.hex
-            logger.warning(
-                "MCP POST sin session_id ni cabecera de sesión: "
-                "enrutando a la única sesión SSE activa. "
-                "Para varios clientes, define MCP_SSE_STRICT_SESSION=1 y corrige el cliente."
-            )
-            return _scope_with_query_string(scope, params)
+    if MCP_SSE_STRICT_SESSION:
+        return scope
+
+    writers = getattr(sse, "_read_stream_writers", None)
+    if not isinstance(writers, dict) or not writers:
+        return scope
+
+    fb_hex = _fallback_session_hex_for_post(writers)
+    if fb_hex:
+        params["session_id"] = fb_hex
+        logger.warning(
+            "MCP POST sin session_id ni cabecera: usando heurística de sesión "
+            "(última o única en este proceso)."
+        )
+        return _scope_with_query_string(scope, params)
 
     return scope
 
@@ -197,7 +220,12 @@ async def mcp_sse(request: Request) -> Response:
     Conexión SSE del protocolo MCP: el cliente abre GET aquí y recibe el evento
     `endpoint` con la URL relativa `POST /mcp?session_id=<hex>` para mensajes JSON-RPC.
     """
+    keys_before = frozenset(sse._read_stream_writers.keys())
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        keys_after = frozenset(sse._read_stream_writers.keys())
+        new_keys = keys_after - keys_before
+        if len(new_keys) == 1:
+            _RECENT_MCP_SESSION_HEX.append(next(iter(new_keys)).hex)
         await mcp_server.run(
             streams[0],
             streams[1],
@@ -209,9 +237,9 @@ async def mcp_sse(request: Request) -> Response:
 @app.post("/mcp")
 async def mcp_post_on_sse_path(request: Request) -> Response:
     """
-    JSON-RPC MCP en el mismo path que el SSE. Orden de resolución de sesión:
-    query `session_id`, cabecera `mcp-session-id` / `x-session-id`, o (si no
-    `MCP_SSE_STRICT_SESSION`) la única sesión SSE abierta en este proceso.
+    JSON-RPC MCP en el mismo path que el SSE. Resolución de `session_id`: query,
+    cabeceras `mcp-session-id` / `x-session-id`, o heurística local si no
+    `MCP_SSE_STRICT_SESSION` (ver `_RECENT_MCP_SESSION_HEX` en GET /mcp).
     """
     return await _mcp_post_message(request)
 
