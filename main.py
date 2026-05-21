@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
@@ -47,6 +48,8 @@ def _tool_text_for_mcp(text: str) -> str:
     )
 # Si es true, no se infiere session_id por heurística (modo multi-cliente / producción).
 MCP_SSE_STRICT_SESSION = os.getenv("MCP_SSE_STRICT_SESSION", "").lower() in ("1", "true", "yes")
+# Streamable HTTP sin estado: cada POST es independiente (recomendado en Cloud Run multi-réplica).
+MCP_STREAMABLE_STATELESS = os.getenv("MCP_STREAMABLE_STATELESS", "1").lower() in ("1", "true", "yes")
 # Logs estructurados para diagnosticar 400/404 en POST MCP (no activar en producción con tráfico alto).
 # Comprueba en tiempo de ejecución (p. ej. tras load_dotenv / vars de Cloud Run).
 def _mcp_is_debug() -> bool:
@@ -90,6 +93,7 @@ def _print_mcp_boot_once() -> None:
         "[MCP-BOOT] "
         f"MCP_DEBUG_env={raw_debug!r} effective_debug={_mcp_is_debug()} "
         f"MCP_SSE_STRICT_SESSION={strict!r} "
+        f"MCP_STREAMABLE_STATELESS={MCP_STREAMABLE_STATELESS} "
         f"API_KEY_AMBIENTES={'set' if key_ok else 'MISSING'} "
         f"API_URL_BASE_len={len(base)} "
         f"K_SERVICE={os.getenv('K_SERVICE', '')!r} K_REVISION={os.getenv('K_REVISION', '')!r}",
@@ -110,12 +114,14 @@ async def _lifespan(_app: FastAPI):
     _ensure_mcp_logger_emits_debug()
     _print_mcp_boot_once()
     logger.info(
-        "[MCP-BOOT] logger=%s handlers=%s debug=%s",
+        "[MCP-BOOT] logger=%s handlers=%s debug=%s streamable_stateless=%s",
         __name__,
         len(logger.handlers),
         _mcp_is_debug(),
+        MCP_STREAMABLE_STATELESS,
     )
-    yield
+    async with _streamable_session_manager.run():
+        yield
 
 
 _EMPTY = "(vacío)"
@@ -247,6 +253,26 @@ app = FastAPI(
 
 # Mismo path que GET /mcp: el evento SSE `endpoint` será `/mcp?session_id=<hex>`.
 sse = SseServerTransport("/mcp")
+
+# Agent Platform / ADK usan Streamable HTTP en POST /mcp (sin session_id en query).
+_streamable_session_manager = StreamableHTTPSessionManager(
+    mcp_server,
+    stateless=MCP_STREAMABLE_STATELESS,
+)
+
+
+def _is_legacy_sse_post(request: Request) -> bool:
+    """POST con session_id en query → cliente MCP SSE (p. ej. prueba.py)."""
+    return bool(request.query_params.get("session_id"))
+
+
+def _is_streamable_http_request(request: Request) -> bool:
+    """GET/DELETE con cabecera mcp-session-id, o POST sin session_id en query."""
+    if request.headers.get(MCP_SESSION_ID_HEADER):
+        return True
+    if request.method in ("GET", "DELETE"):
+        return False
+    return not _is_legacy_sse_post(request)
 
 
 def _normalize_session_token(value: str) -> str:
@@ -385,12 +411,28 @@ async def _mcp_post_message(request: Request) -> Response:
     return AlreadyHandledResponse()
 
 
+async def _handle_streamable_http(request: Request) -> Response:
+    _mcp_debug(
+        "Streamable HTTP",
+        path=request.url.path,
+        method=request.method,
+        stateless=MCP_STREAMABLE_STATELESS,
+        has_mcp_session_id_header=bool(request.headers.get(MCP_SESSION_ID_HEADER)),
+    )
+    await _streamable_session_manager.handle_request(
+        request.scope, request.receive, request._send
+    )
+    return AlreadyHandledResponse()
+
+
 @app.get("/mcp")
 async def mcp_sse(request: Request) -> Response:
     """
-    Conexión SSE del protocolo MCP: el cliente abre GET aquí y recibe el evento
-    `endpoint` con la URL relativa `POST /mcp?session_id=<hex>` para mensajes JSON-RPC.
+    GET /mcp: Streamable HTTP (cabecera mcp-session-id) o SSE legacy (p. ej. prueba.py).
     """
+    if _is_streamable_http_request(request):
+        return await _handle_streamable_http(request)
+
     keys_before = frozenset(sse._read_stream_writers.keys())
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         keys_after = frozenset(sse._read_stream_writers.keys())
@@ -415,29 +457,35 @@ async def mcp_sse(request: Request) -> Response:
 @app.post("/mcp")
 async def handle_messages(request: Request) -> Response:
     """
-    Mensajes JSON-RPC del agente hacia ``POST /mcp`` (mismo path que el SSE).
-
-    No se puede inventar una sesión MCP válida sin el flujo SSE en esta instancia:
-    el transporte exige un ``session_id`` que exista en ``_read_stream_writers``.
-    Un ``JSONResponse`` alternativo rompería el protocolo y podría duplicar la
-    respuesta ASGI respecto a ``handle_post_message``.
-
-    Si ves 400 en multi-réplica (p. ej. Agent Platform + Cloud Run), usa **session
-    affinity** o **max-instances=1** para que GET SSE y POST compartan proceso.
+    POST /mcp: Streamable HTTP (Agent Platform, ADK) o SSE legacy si hay session_id en query.
     """
+    if _is_streamable_http_request(request):
+        return await _handle_streamable_http(request)
+
     initial_sid = request.query_params.get("session_id")
     writers = getattr(sse, "_read_stream_writers", None)
     nwriters = len(writers) if isinstance(writers, dict) else 0
     if not initial_sid and nwriters == 0:
         logger.warning(
-            "POST /mcp sin session_id en la petición y sin sesiones SSE en esta "
-            "instancia (writers=0). Causa habitual: POST en otra réplica que el GET "
-            "/mcp. Mitigación: session affinity o max-instances=1 en Cloud Run."
+            "POST /mcp SSE sin session_id y sin sesiones en esta instancia (writers=0). "
+            "Si el cliente es SSE: GET y POST deben ir a la misma réplica (affinity o "
+            "max-instances=1). Si es Agent Platform: debe usar Streamable HTTP (POST sin "
+            "session_id en query); redeploy con soporte Streamable HTTP en este servicio."
         )
     return await _mcp_post_message(request)
+
+
+@app.delete("/mcp")
+async def mcp_delete(request: Request) -> Response:
+    """Cierre de sesión Streamable HTTP (protocolo MCP)."""
+    if _is_streamable_http_request(request):
+        return await _handle_streamable_http(request)
+    return Response(status_code=405, headers={"Allow": "GET, POST, DELETE"})
 
 
 @app.post("/messages")
 async def mcp_messages(request: Request) -> Response:
     """Igual que POST /mcp; conservado por compatibilidad."""
+    if _is_streamable_http_request(request):
+        return await _handle_streamable_http(request)
     return await _mcp_post_message(request)
