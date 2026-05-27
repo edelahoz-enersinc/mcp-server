@@ -12,10 +12,8 @@ from uuid import UUID
 import httpx
 import mcp.types as types
 from dotenv import load_dotenv
-import vertexai
 from fastapi import FastAPI, Request
 from mcp.server import Server
-from vertexai.preview import reasoning_engines
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -33,7 +31,8 @@ GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
 GEMINI_AGENT_LOCATION = os.getenv("GEMINI_AGENT_LOCATION", "").strip()
 GEMINI_AGENT_ID = os.getenv("GEMINI_AGENT_ID", "").strip()
 
-_gemini_reasoning_engine: reasoning_engines.ReasoningEngine | None = None
+_gemini_reasoning_engine: Any | None = None
+_gemini_init_started = False
 
 
 def _tool_text_for_mcp(text: str) -> str:
@@ -124,7 +123,11 @@ def _print_mcp_boot_once() -> None:
 
 
 def _init_gemini_reasoning_engine() -> None:
-    """Inicializa Vertex AI y el Reasoning Engine remoto para el webhook de Google Chat."""
+    """
+    Inicializa Vertex AI y el Reasoning Engine remoto (import lazy).
+
+    No debe lanzar excepciones: un fallo aquí no debe impedir que Uvicorn abra el puerto.
+    """
     global _gemini_reasoning_engine
     if not GOOGLE_CLOUD_PROJECT or not GEMINI_AGENT_LOCATION or not GEMINI_AGENT_ID:
         logger.warning(
@@ -133,17 +136,38 @@ def _init_gemini_reasoning_engine() -> None:
         )
         return
 
-    vertexai.init(project=GOOGLE_CLOUD_PROJECT, location=GEMINI_AGENT_LOCATION)
-    resource_name = (
-        f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GEMINI_AGENT_LOCATION}"
-        f"/reasoningEngines/{GEMINI_AGENT_ID}"
-    )
-    _gemini_reasoning_engine = reasoning_engines.ReasoningEngine(resource_name)
-    logger.info(
-        "Google Chat: Reasoning Engine listo en location=%s agent_id_len=%s",
-        GEMINI_AGENT_LOCATION,
-        len(GEMINI_AGENT_ID),
-    )
+    try:
+        import vertexai
+        from vertexai.preview import reasoning_engines
+
+        vertexai.init(project=GOOGLE_CLOUD_PROJECT, location=GEMINI_AGENT_LOCATION)
+        resource_name = (
+            f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GEMINI_AGENT_LOCATION}"
+            f"/reasoningEngines/{GEMINI_AGENT_ID}"
+        )
+        _gemini_reasoning_engine = reasoning_engines.ReasoningEngine(resource_name)
+        logger.info(
+            "Google Chat: Reasoning Engine listo en location=%s agent_id_len=%s",
+            GEMINI_AGENT_LOCATION,
+            len(GEMINI_AGENT_ID),
+        )
+    except Exception:
+        _gemini_reasoning_engine = None
+        logger.exception(
+            "Google Chat: no se pudo inicializar Reasoning Engine; "
+            "POST /google-chat responderá con error de configuración."
+        )
+
+
+def _schedule_gemini_init() -> None:
+    """Arranca la init de Gemini en segundo plano tras abrir el puerto HTTP."""
+    global _gemini_init_started
+    if _gemini_init_started:
+        return
+    if not (GOOGLE_CLOUD_PROJECT and GEMINI_AGENT_LOCATION and GEMINI_AGENT_ID):
+        return
+    _gemini_init_started = True
+    asyncio.create_task(asyncio.to_thread(_init_gemini_reasoning_engine))
 
 
 def _extract_reasoning_engine_output(agent_response: Any) -> str:
@@ -166,16 +190,15 @@ def _extract_reasoning_engine_output(agent_response: Any) -> str:
 async def _lifespan(_app: FastAPI):
     _ensure_mcp_logger_emits_debug()
     _print_mcp_boot_once()
-    _init_gemini_reasoning_engine()
     logger.info(
-        "[MCP-BOOT] logger=%s handlers=%s debug=%s streamable_stateless=%s gemini_agent=%s",
+        "[MCP-BOOT] logger=%s handlers=%s debug=%s streamable_stateless=%s",
         __name__,
         len(logger.handlers),
         _mcp_is_debug(),
         MCP_STREAMABLE_STATELESS,
-        _gemini_reasoning_engine is not None,
     )
     async with _streamable_session_manager.run():
+        _schedule_gemini_init()
         yield
 
 
@@ -549,6 +572,12 @@ async def mcp_messages(request: Request) -> Response:
     return await _mcp_post_message(request)
 
 
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness/readiness ligero para probes HTTP (el TCP probe de Cloud Run usa el puerto)."""
+    return {"status": "ok"}
+
+
 @app.post("/google-chat")
 async def google_chat_webhook(request: Request) -> dict[str, str]:
     """
@@ -577,10 +606,15 @@ async def google_chat_webhook(request: Request) -> dict[str, str]:
         return {"text": "No recibí texto en el mensaje."}
 
     if _gemini_reasoning_engine is None:
+        if GOOGLE_CLOUD_PROJECT and GEMINI_AGENT_LOCATION and GEMINI_AGENT_ID:
+            await asyncio.to_thread(_init_gemini_reasoning_engine)
+
+    if _gemini_reasoning_engine is None:
         return {
             "text": (
-                "El agente de Gemini no está configurado en el servidor. "
-                "Revise GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION y GEMINI_AGENT_ID."
+                "El agente de Gemini no está disponible. "
+                "Revise GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION, GEMINI_AGENT_ID "
+                "y los permisos IAM de la cuenta de servicio de Cloud Run."
             )
         }
 
