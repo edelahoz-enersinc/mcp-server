@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -11,8 +12,10 @@ from uuid import UUID
 import httpx
 import mcp.types as types
 from dotenv import load_dotenv
+import vertexai
 from fastapi import FastAPI, Request
 from mcp.server import Server
+from vertexai.preview import reasoning_engines
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -25,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("API_KEY_AMBIENTES")
 API_BASE_URL = os.getenv("API_URL_BASE", "").rstrip("/")
+
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+GEMINI_AGENT_LOCATION = os.getenv("GEMINI_AGENT_LOCATION", "").strip()
+GEMINI_AGENT_ID = os.getenv("GEMINI_AGENT_ID", "").strip()
+
+_gemini_reasoning_engine: reasoning_engines.ReasoningEngine | None = None
 
 
 def _tool_text_for_mcp(text: str) -> str:
@@ -89,6 +98,7 @@ def _print_mcp_boot_once() -> None:
     strict = os.getenv("MCP_SSE_STRICT_SESSION")
     key_ok = bool((os.getenv("API_KEY_AMBIENTES") or "").strip())
     base = (os.getenv("API_URL_BASE") or "").strip()
+    gemini_ok = bool(GOOGLE_CLOUD_PROJECT and GEMINI_AGENT_LOCATION and GEMINI_AGENT_ID)
     print(
         "[MCP-BOOT] "
         f"MCP_DEBUG_env={raw_debug!r} effective_debug={_mcp_is_debug()} "
@@ -96,6 +106,10 @@ def _print_mcp_boot_once() -> None:
         f"MCP_STREAMABLE_STATELESS={MCP_STREAMABLE_STATELESS} "
         f"API_KEY_AMBIENTES={'set' if key_ok else 'MISSING'} "
         f"API_URL_BASE_len={len(base)} "
+        f"GEMINI_AGENT={'configured' if gemini_ok else 'MISSING_VARS'} "
+        f"GOOGLE_CLOUD_PROJECT={'set' if GOOGLE_CLOUD_PROJECT else 'MISSING'} "
+        f"GEMINI_AGENT_LOCATION={GEMINI_AGENT_LOCATION!r} "
+        f"GEMINI_AGENT_ID_len={len(GEMINI_AGENT_ID)} "
         f"K_SERVICE={os.getenv('K_SERVICE', '')!r} K_REVISION={os.getenv('K_REVISION', '')!r}",
         flush=True,
     )
@@ -109,16 +123,57 @@ def _print_mcp_boot_once() -> None:
         )
 
 
+def _init_gemini_reasoning_engine() -> None:
+    """Inicializa Vertex AI y el Reasoning Engine remoto para el webhook de Google Chat."""
+    global _gemini_reasoning_engine
+    if not GOOGLE_CLOUD_PROJECT or not GEMINI_AGENT_LOCATION or not GEMINI_AGENT_ID:
+        logger.warning(
+            "Google Chat: faltan GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION o "
+            "GEMINI_AGENT_ID; POST /google-chat no podrá invocar al agente."
+        )
+        return
+
+    vertexai.init(project=GOOGLE_CLOUD_PROJECT, location=GEMINI_AGENT_LOCATION)
+    resource_name = (
+        f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GEMINI_AGENT_LOCATION}"
+        f"/reasoningEngines/{GEMINI_AGENT_ID}"
+    )
+    _gemini_reasoning_engine = reasoning_engines.ReasoningEngine(resource_name)
+    logger.info(
+        "Google Chat: Reasoning Engine listo en location=%s agent_id_len=%s",
+        GEMINI_AGENT_LOCATION,
+        len(GEMINI_AGENT_ID),
+    )
+
+
+def _extract_reasoning_engine_output(agent_response: Any) -> str:
+    """Obtiene el texto de salida del agente (dict con 'output' u otros formatos)."""
+    if agent_response is None:
+        return ""
+    if isinstance(agent_response, dict):
+        output = agent_response.get("output")
+        if output is not None:
+            return str(output).strip()
+        return json.dumps(agent_response, ensure_ascii=False)
+    if hasattr(agent_response, "get"):
+        output = agent_response.get("output")  # type: ignore[union-attr]
+        if output is not None:
+            return str(output).strip()
+    return str(agent_response).strip()
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _ensure_mcp_logger_emits_debug()
     _print_mcp_boot_once()
+    _init_gemini_reasoning_engine()
     logger.info(
-        "[MCP-BOOT] logger=%s handlers=%s debug=%s streamable_stateless=%s",
+        "[MCP-BOOT] logger=%s handlers=%s debug=%s streamable_stateless=%s gemini_agent=%s",
         __name__,
         len(logger.handlers),
         _mcp_is_debug(),
         MCP_STREAMABLE_STATELESS,
+        _gemini_reasoning_engine is not None,
     )
     async with _streamable_session_manager.run():
         yield
@@ -247,7 +302,10 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
 # --- FastAPI: aplicación y transporte SSE (MCP) ---
 app = FastAPI(
     title="Gestor ambientes ETRM (MCP)",
-    description="Servidor MCP sobre HTTP+SSE para consulta y control de ambientes.",
+    description=(
+        "Servidor MCP (HTTP+SSE / Streamable HTTP) y webhook de Google Chat "
+        "conectado a un Reasoning Engine de Vertex AI."
+    ),
     lifespan=_lifespan,
 )
 
@@ -489,3 +547,52 @@ async def mcp_messages(request: Request) -> Response:
     if _is_streamable_http_request(request):
         return await _handle_streamable_http(request)
     return await _mcp_post_message(request)
+
+
+@app.post("/google-chat")
+async def google_chat_webhook(request: Request) -> dict[str, str]:
+    """
+    Webhook de Google Chat: reenvía mensajes de usuario al Reasoning Engine remoto.
+
+    Respuesta esperada por Chat: ``{"text": "<respuesta>"}``.
+    """
+    try:
+        event = await request.json()
+    except Exception as exc:
+        logger.warning("Google Chat: JSON inválido: %s", exc)
+        return {"text": "No pude leer el mensaje (formato JSON inválido)."}
+
+    if not isinstance(event, dict):
+        return {"text": "Evento de Chat no reconocido."}
+
+    if event.get("type") != "MESSAGE":
+        return {}
+
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return {"text": "El evento no incluye un mensaje válido."}
+
+    user_message = (message.get("text") or "").strip()
+    if not user_message:
+        return {"text": "No recibí texto en el mensaje."}
+
+    if _gemini_reasoning_engine is None:
+        return {
+            "text": (
+                "El agente de Gemini no está configurado en el servidor. "
+                "Revise GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION y GEMINI_AGENT_ID."
+            )
+        }
+
+    try:
+        agent_response = await asyncio.to_thread(
+            _gemini_reasoning_engine.query,
+            input=user_message,
+        )
+        text_reply = _extract_reasoning_engine_output(agent_response)
+        if not text_reply:
+            text_reply = "El agente no devolvió contenido en la respuesta."
+        return {"text": text_reply}
+    except Exception as exc:
+        logger.exception("Google Chat: error al invocar Reasoning Engine")
+        return {"text": f"Error al consultar al agente: {exc!s}"}

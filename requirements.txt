@@ -3,3 +3,4 @@ fastapi
 uvicorn[standard]
 httpx
 python-dotenv
+google-cloud-aiplatform[reasoningengine]
