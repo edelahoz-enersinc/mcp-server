@@ -593,42 +593,52 @@ async def health() -> dict[str, str]:
 
 @app.post("/google-chat")
 async def google_chat_webhook(request: Request) -> dict[str, str]:
-    """Webhook de Google Chat (modo diagnóstico): log del evento + consulta al agente remoto."""
+    """Webhook de Google Chat: mapeo messagePayload/message y consulta al agente remoto."""
     event = await request.json()
-
-    # IMPRESCINDIBLE: ver en Cloud Logging el payload exacto de Google Chat
-    print(f"--- EVENTO RECIBIDO DESDE GOOGLE CHAT: {event} ---", flush=True)
+    print(f"--- EVENTO DETECTADO ---: {event}", flush=True)
 
     user_message = ""
 
-    # 1. Mensaje de texto normal
-    if event.get("type") == "MESSAGE" and "message" in event:
+    # Mapeo correcto de la API moderna de Google Chat
+    # 1. Buscar en messagePayload (interfaz asíncrona/add-ons)
+    if "messagePayload" in event and "message" in event["messagePayload"]:
+        user_message = event["messagePayload"]["message"].get("text", "")
+
+    # 2. Buscar en la raíz (formato HTTP síncrono estándar)
+    elif "message" in event:
         user_message = event["message"].get("text", "")
 
-    # 2. Bot agregado al espacio
+    # 3. Si es un evento de espacio nuevo sin texto
     elif event.get("type") == "ADDED_TO_SPACE":
-        user_message = "Hola, me acabo de unir al espacio. ¿Cuál es el estado de los ambientes?"
+        return {
+            "text": (
+                "¡Hola Ezequiel! Soy el Gestor de Ambientes ETRM. "
+                "¿En qué ambiente te puedo colaborar hoy?"
+            )
+        }
 
-    # Fallback
+    # Si no se detectó texto, evitamos llamar a Gemini para no perder tiempo
     if not user_message:
-        user_message = "Hola, dame un reporte general"
+        return {
+            "text": "Recibí un evento del chat, pero no logré extraer el texto del mensaje."
+        }
 
     try:
-        print(f"Invocando al agente Gemini con el texto: '{user_message}'", flush=True)
-
+        print(f"Enviando a Gemini Vertex AI: '{user_message}'", flush=True)
         agent = await asyncio.to_thread(get_gemini_agent)
         agent_response = await asyncio.to_thread(agent.query, input=user_message)
-
         if isinstance(agent_response, dict):
-            text_reply = agent_response.get("output", "El agente no generó ninguna salida.")
+            text_reply = agent_response.get(
+                "output", "El agente procesó la consulta pero no generó respuesta."
+            )
         else:
             text_reply = _extract_reasoning_engine_output(agent_response) or (
-                "El agente no generó ninguna salida."
+                "El agente procesó la consulta pero no generó respuesta."
             )
 
     except Exception as exc:
-        text_reply = f"Error al procesar con Gemini: {exc!s}"
-        print(f"🚨 ERROR EN GEMINI: {exc!s}", flush=True)
+        text_reply = f"Error en el puente con Gemini: {exc!s}"
+        print(f"🚨 EXCEPCIÓN VERTEX: {exc!s}", flush=True)
         logger.exception("Google Chat: error al invocar Reasoning Engine")
 
     return {"text": str(text_reply)}
