@@ -170,6 +170,19 @@ def _schedule_gemini_init() -> None:
     asyncio.create_task(asyncio.to_thread(_init_gemini_reasoning_engine))
 
 
+def get_gemini_agent() -> Any:
+    """Devuelve el Reasoning Engine remoto; lo inicializa bajo demanda si hace falta."""
+    global _gemini_reasoning_engine
+    if _gemini_reasoning_engine is None:
+        _init_gemini_reasoning_engine()
+    if _gemini_reasoning_engine is None:
+        raise RuntimeError(
+            "Agente Gemini no disponible. Revise GOOGLE_CLOUD_PROJECT, "
+            "GEMINI_AGENT_LOCATION, GEMINI_AGENT_ID y permisos IAM de Cloud Run."
+        )
+    return _gemini_reasoning_engine
+
+
 def _extract_reasoning_engine_output(agent_response: Any) -> str:
     """Obtiene el texto de salida del agente (dict con 'output' u otros formatos)."""
     if agent_response is None:
@@ -580,53 +593,42 @@ async def health() -> dict[str, str]:
 
 @app.post("/google-chat")
 async def google_chat_webhook(request: Request) -> dict[str, str]:
-    """
-    Webhook de Google Chat: reenvía mensajes de usuario al Reasoning Engine remoto.
+    """Webhook de Google Chat (modo diagnóstico): log del evento + consulta al agente remoto."""
+    event = await request.json()
 
-    Respuesta esperada por Chat: ``{"text": "<respuesta>"}``.
-    """
-    try:
-        event = await request.json()
-    except Exception as exc:
-        logger.warning("Google Chat: JSON inválido: %s", exc)
-        return {"text": "No pude leer el mensaje (formato JSON inválido)."}
+    # IMPRESCINDIBLE: ver en Cloud Logging el payload exacto de Google Chat
+    print(f"--- EVENTO RECIBIDO DESDE GOOGLE CHAT: {event} ---", flush=True)
 
-    if not isinstance(event, dict):
-        return {"text": "Evento de Chat no reconocido."}
+    user_message = ""
 
-    if event.get("type") != "MESSAGE":
-        return {}
+    # 1. Mensaje de texto normal
+    if event.get("type") == "MESSAGE" and "message" in event:
+        user_message = event["message"].get("text", "")
 
-    message = event.get("message")
-    if not isinstance(message, dict):
-        return {"text": "El evento no incluye un mensaje válido."}
+    # 2. Bot agregado al espacio
+    elif event.get("type") == "ADDED_TO_SPACE":
+        user_message = "Hola, me acabo de unir al espacio. ¿Cuál es el estado de los ambientes?"
 
-    user_message = (message.get("text") or "").strip()
+    # Fallback
     if not user_message:
-        return {"text": "No recibí texto en el mensaje."}
-
-    if _gemini_reasoning_engine is None:
-        if GOOGLE_CLOUD_PROJECT and GEMINI_AGENT_LOCATION and GEMINI_AGENT_ID:
-            await asyncio.to_thread(_init_gemini_reasoning_engine)
-
-    if _gemini_reasoning_engine is None:
-        return {
-            "text": (
-                "El agente de Gemini no está disponible. "
-                "Revise GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION, GEMINI_AGENT_ID "
-                "y los permisos IAM de la cuenta de servicio de Cloud Run."
-            )
-        }
+        user_message = "Hola, dame un reporte general"
 
     try:
-        agent_response = await asyncio.to_thread(
-            _gemini_reasoning_engine.query,
-            input=user_message,
-        )
-        text_reply = _extract_reasoning_engine_output(agent_response)
-        if not text_reply:
-            text_reply = "El agente no devolvió contenido en la respuesta."
-        return {"text": text_reply}
+        print(f"Invocando al agente Gemini con el texto: '{user_message}'", flush=True)
+
+        agent = await asyncio.to_thread(get_gemini_agent)
+        agent_response = await asyncio.to_thread(agent.query, input=user_message)
+
+        if isinstance(agent_response, dict):
+            text_reply = agent_response.get("output", "El agente no generó ninguna salida.")
+        else:
+            text_reply = _extract_reasoning_engine_output(agent_response) or (
+                "El agente no generó ninguna salida."
+            )
+
     except Exception as exc:
+        text_reply = f"Error al procesar con Gemini: {exc!s}"
+        print(f"🚨 ERROR EN GEMINI: {exc!s}", flush=True)
         logger.exception("Google Chat: error al invocar Reasoning Engine")
-        return {"text": f"Error al consultar al agente: {exc!s}"}
+
+    return {"text": str(text_reply)}
