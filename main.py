@@ -33,6 +33,7 @@ GEMINI_AGENT_ID = os.getenv("GEMINI_AGENT_ID", "").strip()
 
 _gemini_reasoning_engine: Any | None = None
 _gemini_init_started = False
+_gemini_last_init_error: str | None = None
 
 
 def _tool_text_for_mcp(text: str) -> str:
@@ -122,18 +123,106 @@ def _print_mcp_boot_once() -> None:
         )
 
 
+def _gemini_resource_name() -> str:
+    return (
+        f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GEMINI_AGENT_LOCATION}"
+        f"/reasoningEngines/{GEMINI_AGENT_ID}"
+    )
+
+
+def _resolve_runtime_service_account() -> str:
+    """Cuenta de servicio que usa este proceso (metadata GCP o variable opcional)."""
+    override = os.getenv("GEMINI_RUNTIME_SERVICE_ACCOUNT", "").strip()
+    if override:
+        return override
+    try:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            "service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            email = resp.read().decode("utf-8").strip()
+            if email:
+                return email
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    return "(cuenta de servicio del servicio Cloud Run → pestaña Seguridad)"
+
+
+def _record_gemini_init_failure(exc: Exception) -> None:
+    """Guarda un mensaje accionable para Chat/logs (IAM, config, recurso inexistente)."""
+    global _gemini_last_init_error
+    sa = _resolve_runtime_service_account()
+    resource = _gemini_resource_name()
+
+    if not GOOGLE_CLOUD_PROJECT or not GEMINI_AGENT_LOCATION or not GEMINI_AGENT_ID:
+        _gemini_last_init_error = (
+            "Configuración incompleta: defina GOOGLE_CLOUD_PROJECT, "
+            "GEMINI_AGENT_LOCATION y GEMINI_AGENT_ID en Cloud Run."
+        )
+        return
+
+    permission_denied = False
+    try:
+        from google.api_core import exceptions as gcp_exceptions
+
+        permission_denied = isinstance(exc, gcp_exceptions.PermissionDenied)
+    except ImportError:
+        permission_denied = "PermissionDenied" in type(exc).__name__ or "403" in str(exc)
+
+    if permission_denied:
+        _gemini_last_init_error = (
+            "PERMISSION_DENIED (IAM): la cuenta de servicio de Cloud Run no puede leer "
+            f"el Reasoning Engine.\n"
+            f"• Cuenta en ejecución: {sa}\n"
+            f"• Recurso: {resource}\n"
+            f"• Permiso: aiplatform.reasoningEngines.get (y query)\n"
+            f"• En el proyecto {GOOGLE_CLOUD_PROJECT} ejecute:\n"
+            f'  gcloud projects add-iam-policy-binding {GOOGLE_CLOUD_PROJECT} \\\n'
+            f'    --member="serviceAccount:{sa}" \\\n'
+            f'    --role="roles/aiplatform.user"'
+        )
+        return
+
+    _gemini_last_init_error = (
+        f"No se pudo conectar al Reasoning Engine.\n"
+        f"• Recurso: {resource}\n"
+        f"• Cuenta: {sa}\n"
+        f"• Detalle: {exc!s}"
+    )
+
+
+def _gemini_user_error_message(exc: Exception | None = None) -> str:
+    """Mensaje corto para Google Chat a partir del último fallo de init o de una excepción."""
+    if _gemini_last_init_error:
+        return _gemini_last_init_error
+    if exc is not None:
+        _record_gemini_init_failure(exc)
+        if _gemini_last_init_error:
+            return _gemini_last_init_error
+    return (
+        "Agente Gemini no disponible. Revise variables de entorno e IAM "
+        "(roles/aiplatform.user en el proyecto del Reasoning Engine)."
+    )
+
+
 def _init_gemini_reasoning_engine() -> None:
     """
     Inicializa Vertex AI y el Reasoning Engine remoto (import lazy).
 
     No debe lanzar excepciones: un fallo aquí no debe impedir que Uvicorn abra el puerto.
     """
-    global _gemini_reasoning_engine
+    global _gemini_reasoning_engine, _gemini_last_init_error
     if not GOOGLE_CLOUD_PROJECT or not GEMINI_AGENT_LOCATION or not GEMINI_AGENT_ID:
-        logger.warning(
-            "Google Chat: faltan GOOGLE_CLOUD_PROJECT, GEMINI_AGENT_LOCATION o "
-            "GEMINI_AGENT_ID; POST /google-chat no podrá invocar al agente."
+        _gemini_last_init_error = (
+            "Configuración incompleta: defina GOOGLE_CLOUD_PROJECT, "
+            "GEMINI_AGENT_LOCATION y GEMINI_AGENT_ID en Cloud Run."
         )
+        logger.warning("Google Chat: %s", _gemini_last_init_error)
         return
 
     try:
@@ -141,22 +230,19 @@ def _init_gemini_reasoning_engine() -> None:
         from vertexai.preview import reasoning_engines
 
         vertexai.init(project=GOOGLE_CLOUD_PROJECT, location=GEMINI_AGENT_LOCATION)
-        resource_name = (
-            f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GEMINI_AGENT_LOCATION}"
-            f"/reasoningEngines/{GEMINI_AGENT_ID}"
-        )
-        _gemini_reasoning_engine = reasoning_engines.ReasoningEngine(resource_name)
+        _gemini_reasoning_engine = reasoning_engines.ReasoningEngine(_gemini_resource_name())
+        _gemini_last_init_error = None
         logger.info(
-            "Google Chat: Reasoning Engine listo en location=%s agent_id_len=%s",
+            "Google Chat: Reasoning Engine listo en location=%s agent_id_len=%s sa=%s",
             GEMINI_AGENT_LOCATION,
             len(GEMINI_AGENT_ID),
+            _resolve_runtime_service_account(),
         )
-    except Exception:
+    except Exception as exc:
         _gemini_reasoning_engine = None
-        logger.exception(
-            "Google Chat: no se pudo inicializar Reasoning Engine; "
-            "POST /google-chat responderá con error de configuración."
-        )
+        _record_gemini_init_failure(exc)
+        logger.error("Google Chat: init Reasoning Engine falló: %s", _gemini_last_init_error)
+        logger.exception("Google Chat: traceback init Reasoning Engine")
 
 
 def _schedule_gemini_init() -> None:
@@ -176,10 +262,7 @@ def get_gemini_agent() -> Any:
     if _gemini_reasoning_engine is None:
         _init_gemini_reasoning_engine()
     if _gemini_reasoning_engine is None:
-        raise RuntimeError(
-            "Agente Gemini no disponible. Revise GOOGLE_CLOUD_PROJECT, "
-            "GEMINI_AGENT_LOCATION, GEMINI_AGENT_ID y permisos IAM de Cloud Run."
-        )
+        raise RuntimeError(_gemini_user_error_message())
     return _gemini_reasoning_engine
 
 
@@ -721,8 +804,8 @@ async def google_chat_webhook(request: Request) -> dict[str, Any]:
             )
 
     except Exception as exc:
-        text_reply = f"Error en Vertex: {exc!s}"
-        print(f"🚨 ERROR: {exc!s}", flush=True)
+        text_reply = f"Error en Vertex:\n{_gemini_user_error_message(exc)}"
+        print(f"🚨 ERROR VERTEX: {text_reply}", flush=True)
         logger.exception("Google Chat: error al invocar Reasoning Engine")
 
     return _format_google_chat_http_response(
