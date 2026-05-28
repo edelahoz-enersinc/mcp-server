@@ -591,8 +591,54 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _google_chat_cards_response(text_reply: str, card_id: str) -> dict[str, Any]:
-    """Respuesta síncrona + cardsV2 (texto plano y tarjeta para add-ons)."""
+def _is_workspace_addon_event(event: dict[str, Any]) -> bool:
+    """True si el payload viene de Google Workspace Add-ons (User-Agent: Google-gsuiteaddons)."""
+    if isinstance(event.get("chat"), dict):
+        return True
+    common = event.get("commonEventObject")
+    return isinstance(common, dict) and common.get("hostApp") == "CHAT"
+
+
+def _extract_chat_user_message(event: dict[str, Any]) -> str:
+    """Extrae texto del usuario: add-on (chat.messagePayload) o webhook HTTP clásico."""
+    chat = event.get("chat")
+    if isinstance(chat, dict):
+        app_cmd = chat.get("appCommandPayload")
+        if isinstance(app_cmd, dict):
+            msg = app_cmd.get("message")
+            if isinstance(msg, dict):
+                text = msg.get("text") or msg.get("argumentText") or ""
+                if text:
+                    return str(text).strip()
+
+        payload = chat.get("messagePayload")
+        if isinstance(payload, dict):
+            msg = payload.get("message")
+            if isinstance(msg, dict):
+                text = msg.get("text") or msg.get("argumentText") or ""
+                if text:
+                    return str(text).strip()
+
+    if isinstance(event.get("messagePayload"), dict):
+        msg = event["messagePayload"].get("message")
+        if isinstance(msg, dict):
+            return str(msg.get("text") or "").strip()
+
+    if isinstance(event.get("message"), dict):
+        return str(event["message"].get("text") or "").strip()
+
+    return ""
+
+
+def _is_chat_added_to_space(event: dict[str, Any]) -> bool:
+    chat = event.get("chat")
+    if isinstance(chat, dict) and chat.get("addedToSpacePayload"):
+        return True
+    return event.get("type") == "ADDED_TO_SPACE"
+
+
+def _build_chat_message(text_reply: str, card_id: str) -> dict[str, Any]:
+    """Objeto Message de Chat API (text + cardsV2 opcional)."""
     if card_id == "geminiResponse":
         card = {
             "header": {
@@ -614,26 +660,52 @@ def _google_chat_cards_response(text_reply: str, card_id: str) -> dict[str, Any]
     }
 
 
+def _format_google_chat_http_response(
+    event: dict[str, Any], message: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Add-ons exigen hostAppDataAction.createMessageAction.message.
+    Webhook HTTP clásico acepta text/cardsV2 en la raíz del JSON.
+    """
+    if _is_workspace_addon_event(event):
+        return {
+            "hostAppDataAction": {
+                "chatDataAction": {
+                    "createMessageAction": {"message": message},
+                },
+            },
+        }
+    return message
+
+
 @app.post("/google-chat")
 async def google_chat_webhook(request: Request) -> dict[str, Any]:
-    """Webhook de Google Chat: extracción robusta del texto y respuesta text + cardsV2."""
+    """Webhook Google Chat / Workspace Add-ons → Reasoning Engine → respuesta en Chat."""
     event = await request.json()
-    print(f"--- EVENTO ENTRANTE ---: {event}", flush=True)
+    addon = _is_workspace_addon_event(event) if isinstance(event, dict) else False
+    print(
+        f"--- EVENTO ENTRANTE --- addon={addon} keys={list(event.keys()) if isinstance(event, dict) else type(event)}",
+        flush=True,
+    )
 
-    user_message = ""
+    if not isinstance(event, dict):
+        msg = _build_chat_message("Evento de Chat no reconocido.", "error")
+        return _format_google_chat_http_response({}, msg)
 
-    # 1. Extracción robusta del texto
-    if "messagePayload" in event and "message" in event["messagePayload"]:
-        user_message = event["messagePayload"]["message"].get("text", "")
-    elif "message" in event:
-        user_message = event["message"].get("text", "")
-    elif event.get("type") == "ADDED_TO_SPACE":
+    if _is_chat_added_to_space(event):
         text_reply = "¡Hola! Soy el Gestor de Ambientes ETRM. ¿En qué puedo ayudarte hoy?"
-        return _google_chat_cards_response(text_reply, "welcome")
+        return _format_google_chat_http_response(
+            event, _build_chat_message(text_reply, "welcome")
+        )
+
+    user_message = _extract_chat_user_message(event)
+    print(f"Texto extraído para Gemini: {user_message!r}", flush=True)
 
     if not user_message:
         text_reply = "Recibí la notificación, pero no detecté texto en el mensaje."
-        return _google_chat_cards_response(text_reply, "error")
+        return _format_google_chat_http_response(
+            event, _build_chat_message(text_reply, "error")
+        )
 
     try:
         print(f"Llamando a Gemini con: '{user_message}'", flush=True)
@@ -653,5 +725,6 @@ async def google_chat_webhook(request: Request) -> dict[str, Any]:
         print(f"🚨 ERROR: {exc!s}", flush=True)
         logger.exception("Google Chat: error al invocar Reasoning Engine")
 
-    # Respuesta blindada: formato síncrono + tarjeta (add-ons / Workspace)
-    return _google_chat_cards_response(str(text_reply), "geminiResponse")
+    return _format_google_chat_http_response(
+        event, _build_chat_message(str(text_reply), "geminiResponse")
+    )
