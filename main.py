@@ -591,54 +591,67 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _google_chat_cards_response(text_reply: str, card_id: str) -> dict[str, Any]:
+    """Respuesta síncrona + cardsV2 (texto plano y tarjeta para add-ons)."""
+    if card_id == "geminiResponse":
+        card = {
+            "header": {
+                "title": "Gestor de Ambientes",
+                "subtitle": "Respuesta de Gemini AI",
+                "imageUrl": (
+                    "https://fonts.gstatic.com/s/i/short-term/release/"
+                    "googlesymbols/robot/default/48px.svg"
+                ),
+            },
+            "sections": [{"widgets": [{"textParagraph": {"text": text_reply}}]}],
+        }
+    else:
+        card = {"header": {"title": text_reply}}
+
+    return {
+        "text": text_reply,
+        "cardsV2": [{"cardId": card_id, "card": card}],
+    }
+
+
 @app.post("/google-chat")
-async def google_chat_webhook(request: Request) -> dict[str, str]:
-    """Webhook de Google Chat: mapeo messagePayload/message y consulta al agente remoto."""
+async def google_chat_webhook(request: Request) -> dict[str, Any]:
+    """Webhook de Google Chat: extracción robusta del texto y respuesta text + cardsV2."""
     event = await request.json()
-    print(f"--- EVENTO DETECTADO ---: {event}", flush=True)
+    print(f"--- EVENTO ENTRANTE ---: {event}", flush=True)
 
     user_message = ""
 
-    # Mapeo correcto de la API moderna de Google Chat
-    # 1. Buscar en messagePayload (interfaz asíncrona/add-ons)
+    # 1. Extracción robusta del texto
     if "messagePayload" in event and "message" in event["messagePayload"]:
         user_message = event["messagePayload"]["message"].get("text", "")
-
-    # 2. Buscar en la raíz (formato HTTP síncrono estándar)
     elif "message" in event:
         user_message = event["message"].get("text", "")
-
-    # 3. Si es un evento de espacio nuevo sin texto
     elif event.get("type") == "ADDED_TO_SPACE":
-        return {
-            "text": (
-                "¡Hola Ezequiel! Soy el Gestor de Ambientes ETRM. "
-                "¿En qué ambiente te puedo colaborar hoy?"
-            )
-        }
+        text_reply = "¡Hola! Soy el Gestor de Ambientes ETRM. ¿En qué puedo ayudarte hoy?"
+        return _google_chat_cards_response(text_reply, "welcome")
 
-    # Si no se detectó texto, evitamos llamar a Gemini para no perder tiempo
     if not user_message:
-        return {
-            "text": "Recibí un evento del chat, pero no logré extraer el texto del mensaje."
-        }
+        text_reply = "Recibí la notificación, pero no detecté texto en el mensaje."
+        return _google_chat_cards_response(text_reply, "error")
 
     try:
-        print(f"Enviando a Gemini Vertex AI: '{user_message}'", flush=True)
+        print(f"Llamando a Gemini con: '{user_message}'", flush=True)
         agent = await asyncio.to_thread(get_gemini_agent)
         agent_response = await asyncio.to_thread(agent.query, input=user_message)
         if isinstance(agent_response, dict):
             text_reply = agent_response.get(
-                "output", "El agente procesó la consulta pero no generó respuesta."
+                "output", "Consulta procesada sin respuesta de texto."
             )
         else:
             text_reply = _extract_reasoning_engine_output(agent_response) or (
-                "El agente procesó la consulta pero no generó respuesta."
+                "Consulta procesada sin respuesta de texto."
             )
 
     except Exception as exc:
-        text_reply = f"Error en el puente con Gemini: {exc!s}"
-        print(f"🚨 EXCEPCIÓN VERTEX: {exc!s}", flush=True)
+        text_reply = f"Error en Vertex: {exc!s}"
+        print(f"🚨 ERROR: {exc!s}", flush=True)
         logger.exception("Google Chat: error al invocar Reasoning Engine")
 
-    return {"text": str(text_reply)}
+    # Respuesta blindada: formato síncrono + tarjeta (add-ons / Workspace)
+    return _google_chat_cards_response(str(text_reply), "geminiResponse")
